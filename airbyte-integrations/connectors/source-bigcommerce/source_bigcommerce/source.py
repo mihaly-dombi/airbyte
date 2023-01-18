@@ -4,7 +4,7 @@
 
 
 from abc import ABC
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
 
 import pendulum
 import requests
@@ -107,6 +107,12 @@ class IncrementalBigcommerceStream(BigcommerceStream, ABC):
     def get_updated_state(self, current_stream_state: MutableMapping[str, Any], latest_record: Mapping[str, Any]) -> Mapping[str, Any]:
         return {self.cursor_field: max(latest_record.get(self.cursor_field, ""), current_stream_state.get(self.cursor_field, ""))}
 
+    @property
+    def default_state_comparison_value(self) -> Union[int, str]:
+        # certain streams are using `id` field as `cursor_field`, which requires to use `int` type,
+        # but many other use `str` values for this, we determine what to use based on `cursor_field` value
+        return 0 if self.cursor_field == "id" else ""
+
     def request_params(self, stream_state: Mapping[str, Any] = None, next_page_token: Mapping[str, Any] = None, **kwargs):
         params = super().request_params(stream_state=stream_state, next_page_token=next_page_token, **kwargs)
         # If there is a next page token then we should only send pagination-related parameters.
@@ -125,16 +131,62 @@ class IncrementalBigcommerceStream(BigcommerceStream, ABC):
             yield from records_slice
 
 
-class OrderSubstream(IncrementalBigcommerceStream, ABC):
+class BigcommerceSubstream(IncrementalBigcommerceStream, ABC):
+
+    parent_stream_class: object = None
+    slice_key: str = None
+    nested_record: str = "id"
+    nested_record_field_name: str = None
+
+    @property
+    def parent_stream(self) -> object:
+        """
+        Returns the instance of parent stream, if the substream has a `parent_stream_class` dependency.
+        """
+        return self.parent_stream_class(authenticator=self.authenticator, start_date=self.start_date, store_hash=self.store_hash, access_token=self.access_token) if self.parent_stream_class else None
+
+    def request_params(self, next_page_token: Mapping[str, Any] = None, **kwargs) -> MutableMapping[str, Any]:
+        params = {"limit": self.limit}
+        if next_page_token:
+            params.update(**next_page_token)
+        return params
+
+    def stream_slices(self, stream_state: Mapping[str, Any] = None, **kwargs) -> Iterable[Optional[Mapping[str, Any]]]:
+        """
+        Reading the parent stream for slices with structure:
+        EXAMPLE: for given nested_record as `id` of Orders,
+
+        Outputs:
+            [
+                {slice_key: 123},
+                {slice_key: 456},
+                {...},
+                {slice_key: 999
+            ]
+        """
+
+        # reading parent nested stream_state from child stream state
+        parent_stream_state = stream_state.get(self.parent_stream.name) if stream_state else {}
+
+        # reading the parent stream
+        for record in self.parent_stream.read_records(stream_state=parent_stream_state, **kwargs):
+            # to limit the number of API Calls and reduce the time of data fetch,
+            # we can pull the ready data for child_substream, if nested data is present,
+            # and corresponds to the data of child_substream we need.
+            yield {self.slice_key: record[self.nested_record]}
+
     def read_records(
-        self, stream_state: Mapping[str, Any] = None, stream_slice: Optional[Mapping[str, Any]] = None, **kwargs
+        self,
+        stream_state: Mapping[str, Any] = None,
+        stream_slice: Optional[Mapping[str, Any]] = None,
+        **kwargs,
     ) -> Iterable[Mapping[str, Any]]:
-        orders_stream = Orders(
-            authenticator=self.authenticator, start_date=self.start_date, store_hash=self.store_hash, access_token=self.access_token
-        )
-        for data in orders_stream.read_records(sync_mode=SyncMode.full_refresh):
-            slice = super().read_records(stream_slice={"order_id": data["id"]}, **kwargs)
-            yield from self.filter_records_newer_than_state(stream_state=stream_state, records_slice=slice)
+        """Reading child streams records for each `id`"""
+
+        slice_data = stream_slice.get(self.slice_key)
+        self.logger.info(f"Reading {self.name} for {self.slice_key}: {slice_data}")
+        records = super().read_records(stream_slice=stream_slice, **kwargs)
+        yield from records
 
 
 class ProductSubStream(IncrementalBigcommerceStream, ABC):
@@ -165,23 +217,21 @@ class Products(IncrementalBigcommerceStream):
         return f"catalog/{self.data_field}"
 
 
-class ProductVariants(ProductSubStream):
+class ProductVariants(BigcommerceSubstream):
     api_version = "v3"
     data_field = "variants"
     cursor_field = "id"
 
+    parent_stream_class: object = Products
+    slice_key = "product_id"
+    filter_field = "id"
+
     def path(self, stream_slice: Mapping[str, Any] = None, **kwargs) -> str:
-        product_id = stream_slice["product_id"]
+        product_id = stream_slice[self.slice_key]
         return f"catalog/products/{product_id}/{self.data_field}"
 
     def get_updated_state(self, current_stream_state: MutableMapping[str, Any], latest_record: Mapping[str, Any]) -> Mapping[str, Any]:
         return {self.cursor_field: max(latest_record.get(self.cursor_field, 0), current_stream_state.get(self.cursor_field, 0))}
-
-    def request_params(
-            self, **kwargs
-    ) -> MutableMapping[str, Any]:
-        params = {"limit": self.limit}
-        return params
 
 
 class Orders(IncrementalBigcommerceStream):
@@ -222,9 +272,12 @@ class Pages(IncrementalBigcommerceStream):
         yield from self.filter_records_newer_than_state(stream_state=stream_state, records_slice=slice)
 
 
-class Transactions(OrderSubstream):
+class Transactions(BigcommerceSubstream):
     data_field = "transactions"
     cursor_field = "id"
+    parent_stream_class: object = Orders
+    slice_key = "order_id"
+    filter_field = "id"
 
     def path(self, stream_slice: Mapping[str, Any] = None, **kwargs) -> str:
         order_id = stream_slice["order_id"]
@@ -236,27 +289,23 @@ class Transactions(OrderSubstream):
     def request_params(
         self, stream_state: Mapping[str, Any] = None, next_page_token: Mapping[str, Any] = None, **kwargs
     ) -> MutableMapping[str, Any]:
-        params = {"limit": self.limit}
-        return params
+        return {}
 
 
-class OrderProducts(OrderSubstream):
+class OrderProducts(BigcommerceSubstream):
     api_version = "v2"
     data_field = "products"
     cursor_field = "id"
+    parent_stream_class: object = Orders
+    slice_key = "order_id"
+    filter_field = "id"
 
     def path(self, stream_slice: Mapping[str, Any] = None, **kwargs) -> str:
-        order_id = stream_slice["order_id"]
+        order_id = stream_slice[self.slice_key]
         return f"orders/{order_id}/{self.data_field}"
 
     def get_updated_state(self, current_stream_state: MutableMapping[str, Any], latest_record: Mapping[str, Any]) -> Mapping[str, Any]:
         return {self.cursor_field: max(latest_record.get(self.cursor_field, 0), current_stream_state.get(self.cursor_field, 0))}
-
-    def request_params(
-        self, stream_state: Mapping[str, Any] = None, next_page_token: Mapping[str, Any] = None, **kwargs
-    ) -> MutableMapping[str, Any]:
-        params = {"limit": self.limit}
-        return params
 
     def parse_response(self, response: requests.Response, **kwargs) -> Iterable[Mapping]:
         return response.json() if len(response.content) > 0 else []
@@ -269,10 +318,13 @@ class OrderProducts(OrderSubstream):
             return None
 
 
-class OrderShippingAddresses(OrderSubstream):
+class OrderShippingAddresses(BigcommerceSubstream):
     api_version = "v2"
     data_field = "shipping_addresses"
     cursor_field = "id"
+    parent_stream_class: object = Orders
+    slice_key = "order_id"
+    filter_field = "id"
 
     def path(self, stream_slice: Mapping[str, Any] = None, **kwargs) -> str:
         order_id = stream_slice["order_id"]
@@ -280,12 +332,6 @@ class OrderShippingAddresses(OrderSubstream):
 
     def get_updated_state(self, current_stream_state: MutableMapping[str, Any], latest_record: Mapping[str, Any]) -> Mapping[str, Any]:
         return {self.cursor_field: max(latest_record.get(self.cursor_field, 0), current_stream_state.get(self.cursor_field, 0))}
-
-    def request_params(
-        self, **kwargs
-    ) -> MutableMapping[str, Any]:
-        params = {"limit": self.limit}
-        return params
 
     def parse_response(self, response: requests.Response, **kwargs) -> Iterable[Mapping]:
         return response.json() if len(response.content) > 0 else []
@@ -298,10 +344,13 @@ class OrderShippingAddresses(OrderSubstream):
             return None
 
 
-class OrderCoupons(OrderSubstream):
+class OrderCoupons(BigcommerceSubstream):
     api_version = "v2"
     data_field = "coupons"
     cursor_field = "id"
+    parent_stream_class: object = Orders
+    slice_key = "order_id"
+    filter_field = "id"
 
     def path(self, stream_slice: Mapping[str, Any] = None, **kwargs) -> str:
         order_id = stream_slice["order_id"]
@@ -309,12 +358,6 @@ class OrderCoupons(OrderSubstream):
 
     def get_updated_state(self, current_stream_state: MutableMapping[str, Any], latest_record: Mapping[str, Any]) -> Mapping[str, Any]:
         return {self.cursor_field: max(latest_record.get(self.cursor_field, 0), current_stream_state.get(self.cursor_field, 0))}
-
-    def request_params(
-        self, **kwargs
-    ) -> MutableMapping[str, Any]:
-        params = {"limit": self.limit}
-        return params
 
     def parse_response(self, response: requests.Response, **kwargs) -> Iterable[Mapping]:
         return response.json() if len(response.content) > 0 else []

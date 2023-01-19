@@ -77,7 +77,7 @@ class BigcommerceStream(HttpStream, ABC):
         params.update({"sort": self.order_field})
         if next_page_token:
             params.update(**next_page_token)
-        else:
+        elif self.filter_field:
             params[self.filter_field] = self.start_date
         return params
 
@@ -118,9 +118,9 @@ class IncrementalBigcommerceStream(BigcommerceStream, ABC):
     def request_params(self, stream_state: Mapping[str, Any] = None, next_page_token: Mapping[str, Any] = None, **kwargs):
         params = super().request_params(stream_state=stream_state, next_page_token=next_page_token, **kwargs)
         # If there is a next page token then we should only send pagination-related parameters.
-        if stream_state:
+        if stream_state and self.filter_field:
             params[self.filter_field] = stream_state.get(self.cursor_field)
-        else:
+        elif self.filter_field:
             params[self.filter_field] = self.start_date
         return params
 
@@ -230,10 +230,9 @@ class ProductVariants(BigcommerceSubstream):
     api_version = "v3"
     data_field = "variants"
     cursor_field = "id"
-
     parent_stream_class: object = Products
     slice_key = "product_id"
-    filter_field = "id"
+    filter_field = None
 
     def path(self, stream_slice: Mapping[str, Any] = None, **kwargs) -> str:
         product_id = stream_slice[self.slice_key]
@@ -264,6 +263,7 @@ class Orders(IncrementalBigcommerceStream):
 class Pages(IncrementalBigcommerceStream):
     data_field = "pages"
     cursor_field = "id"
+    filter_field = None
 
     def path(self, **kwargs) -> str:
         return f"content/{self.data_field}"
@@ -283,7 +283,7 @@ class Transactions(BigcommerceSubstream):
     cursor_field = "id"
     parent_stream_class: object = Orders
     slice_key = "order_id"
-    filter_field = "id"
+    filter_field = None
 
     def path(self, stream_slice: Mapping[str, Any] = None, **kwargs) -> str:
         order_id = stream_slice["order_id"]
@@ -301,7 +301,7 @@ class OrderProducts(BigcommerceSubstream):
     cursor_field = "id"
     parent_stream_class: object = Orders
     slice_key = "order_id"
-    filter_field = "id"
+    filter_field = None
 
     def path(self, stream_slice: Mapping[str, Any] = None, **kwargs) -> str:
         order_id = stream_slice[self.slice_key]
@@ -324,7 +324,7 @@ class OrderShippingAddresses(BigcommerceSubstream):
     cursor_field = "id"
     parent_stream_class: object = Orders
     slice_key = "order_id"
-    filter_field = "id"
+    filter_field = None
 
     def path(self, stream_slice: Mapping[str, Any] = None, **kwargs) -> str:
         order_id = stream_slice["order_id"]
@@ -347,7 +347,7 @@ class OrderCoupons(BigcommerceSubstream):
     cursor_field = "id"
     parent_stream_class: object = Orders
     slice_key = "order_id"
-    filter_field = "id"
+    filter_field = None
 
     def path(self, stream_slice: Mapping[str, Any] = None, **kwargs) -> str:
         order_id = stream_slice["order_id"]
@@ -378,6 +378,7 @@ class Store(BigcommerceStream):
     cursor_field = "store_id"
     api_version = "v2"
     data = None
+    filter_field = None
 
     def path(self, **kwargs) -> str:
         return f"{self.data_field}"
